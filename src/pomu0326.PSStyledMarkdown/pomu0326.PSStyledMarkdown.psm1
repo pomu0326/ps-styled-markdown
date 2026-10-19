@@ -1,3 +1,108 @@
+# PowerShell 7.5 までに同梱されている Markdig (0.45.0 未満) は、表の区切り記号 `|` を入れ子にして解析するため、
+# 区切り記号が 1 万個ほどを超える表は深さの上限を超えて ConvertFrom-Markdown が失敗する。
+# 大きな表は行を分けて変換し、変換後の HTML で 1 つの表につなぎ直す。
+$script:TableChunkRowCount = 200
+
+function ConvertTo-MarkdownHtml {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $Markdown
+    )
+
+    $lines = $Markdown -split '\r?\n'
+    $marker = 'PSStyledMarkdown-' + [guid]::NewGuid().ToString('N')
+    $continuations = [System.Collections.Generic.List[string]]::new()
+    $output = [System.Collections.Generic.List[string]]::new()
+    $fence = $null
+
+    $i = 0
+    while ($i -lt $lines.Count) {
+        $line = $lines[$i]
+
+        # コードブロックの中は表として扱わない
+        if ($fence) {
+            if ($line -match "^ {0,3}$fence$($fence[0])*\s*$") {
+                $fence = $null
+            }
+            $output.Add($line)
+            $i++
+            continue
+        }
+        if ($line -match '^ {0,3}(`{3,}|~{3,})') {
+            $fence = $Matches[1]
+            $output.Add($line)
+            $i++
+            continue
+        }
+
+        $startsBlock = $i -eq 0 -or
+            $lines[$i - 1] -match '^\s*$' -or
+            $lines[$i - 1] -match '^ {0,3}#{1,6}(\s|$)'
+        $isTable = $startsBlock -and
+            $line -match '^ {0,3}\S' -and
+            $line.Contains('|') -and
+            $i + 1 -lt $lines.Count -and
+            $lines[$i + 1].Contains('|') -and
+            $lines[$i + 1] -match '^ {0,3}\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$'
+        if (-not $isTable) {
+            $output.Add($line)
+            $i++
+            continue
+        }
+
+        $end = $i + 2
+        while ($end -lt $lines.Count -and
+            $lines[$end] -notmatch '^\s*$' -and
+            $lines[$end].Contains('|')) {
+            $end++
+        }
+        $endsBlock = $end -eq $lines.Count -or
+            $lines[$end] -match '^\s*$' -or
+            $lines[$end] -match '^ {0,3}#{1,6}(\s|$)'
+        $rowCount = $end - $i - 2
+
+        if (-not $endsBlock -or $rowCount -le $script:TableChunkRowCount) {
+            for ($k = $i; $k -lt $end; $k++) {
+                $output.Add($lines[$k])
+            }
+            $i = $end
+            continue
+        }
+
+        # 先頭の行のまとまりは本文に残し、残りは見出し行を付けて個別に変換する
+        $header = $lines[$i], $lines[$i + 1]
+        $firstEnd = $i + 2 + $script:TableChunkRowCount
+        for ($k = $i; $k -lt $firstEnd; $k++) {
+            $output.Add($lines[$k])
+        }
+
+        $rows = New-Object System.Text.StringBuilder
+        for ($start = $firstEnd; $start -lt $end; $start += $script:TableChunkRowCount) {
+            $chunkEnd = [Math]::Min($start + $script:TableChunkRowCount, $end)
+            $chunk = ($header + $lines[$start..($chunkEnd - 1)]) -join "`n"
+            $chunkHtml = (ConvertFrom-Markdown -InputObject $chunk).Html
+            if ($chunkHtml -match '(?s)<tbody>\s*(.*)</tbody>') {
+                [void] $rows.Append($Matches[1])
+            }
+        }
+
+        $output.Add('')
+        $output.Add("<!--${marker}:$($continuations.Count)-->")
+        $continuations.Add($rows.ToString())
+        $i = $end
+    }
+
+    $html = (ConvertFrom-Markdown -InputObject ($output -join "`n")).Html
+    if ($continuations.Count -eq 0) {
+        return $html
+    }
+
+    $html -replace "</tbody>\s*</table>\s*<!--${marker}:(\d+)-->", {
+        $continuations[[int] $_.Groups[1].Value] + "</tbody>`n</table>"
+    }
+}
+
 function Show-StyledMarkdown {
     param(
         [Parameter()]
@@ -16,8 +121,7 @@ function Show-StyledMarkdown {
     
     End {
         $markdown = $content.ToString()
-        $html = ConvertFrom-Markdown -InputObject $markdown |
-            Select-Object -ExpandProperty Html
+        $html = ConvertTo-MarkdownHtml -Markdown $markdown
         
         $sortScript = @'
 <script>
